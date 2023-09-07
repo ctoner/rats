@@ -1,0 +1,740 @@
+package---
+title: "Rat analysis"
+output: html_notebook
+---
+
+
+```{r echo=FALSE, results='hide', message=FALSE}
+library(RPostgreSQL)
+library(knitr)
+options(scipen=999,digits=2)
+options(dplyr.summarise.inform = FALSE)
+knitr::opts_chunk$set(echo = FALSE, cache = TRUE, max.print = -1)
+Sys.setenv(PGPASSWORD="xxxx")
+con <- dbConnect(RPostgres::Postgres(),
+                     dbname="postgres",
+                 port="5432",
+                 host="xxxx",
+                 user="xxxx"
+                 )
+library(dplyr,warn.conflicts = FALSE)
+library(tidyr)
+library(tidyverse) 
+library(ggplot2)
+library(lubridate)
+library(readr)
+library(ggmap)
+library(sf)
+library(viridis)
+library(tigris)
+library(leaflet)
+library(mapview)
+library(rjson)
+```
+
+## Analyze Chicago's rat bating data
+
+Start by importing the rat and and doing counts on the number of request numbers and the number of original request numbers
+
+```{r}
+rats_streets_san <- read_csv('~/Desktop/rats/2019_2022.csv')
+```
+
+```{r}
+#number of service request number
+NROW(rats_streets_san$`Service Request Number`)
+#number of distinct service request numbers
+n_distinct(rats_streets_san$`Service Request Number`)
+```
+
+
+```{r}
+rats_streets_san_baited <- rats_streets_san 
+
+```
+
+
+```{r}
+#rename date opened column
+
+rats_streets_san_baited <- rename(rats_streets_san_baited, date=`Date/Time Opened`)
+
+```
+
+```{r}
+#add year
+
+rats_streets_san_baited$year <- year(rats_streets_san_baited$date)
+```
+
+
+```{r}
+#find totals
+total_2019_2022 <- rats_streets_san_baited %>%
+  group_by(year) %>% 
+  summarize(total = n())
+
+#add category
+total_2019_2022$category <- c("total complaints")
+```
+
+```{r}
+#union baited and totals
+
+graph_data_2019_2022 <- total_2019_2022
+```
+
+
+
+## 411 rat data
+
+```{r}
+#The City of Chicago's 411 agency also released records going back several years related to rat baitings. This will help us get a better understanding of how rat complaints have changed over the decades
+
+rat_data_411 <- read_csv('~/Desktop/rats/csv/2010_2018_rat_complaints.csv')
+```
+
+```{r}
+nrow(rat_data_411)
+
+n_distinct(rat_data_411$`Service Request No`)
+```
+
+```{r}
+#standardize date fomrat
+rat_data_411$`Created Date` <- dmy(rat_data_411$`Created Date`)
+```
+
+```{r}
+#create year column
+rat_data_411$year <- year(rat_data_411$`Created Date`)
+```
+
+
+```{r}
+#filter out original complaints
+distinct_rat_complaints <- rat_data_411 %>%
+  select(year,`Service Request No`) %>% 
+  distinct(year,`Service Request No`) %>% 
+  na.omit()
+```
+
+```{r}
+#tally annual totals
+complaints_2010_2018 <- distinct_rat_complaints %>% 
+  group_by(year) %>% 
+  summarize(total=n())
+
+complaints_2010_2018$category <- c("total complaints")
+```
+
+```{r}
+#union annual counts with annual bait counts
+
+graph_data_2010_2018 <- complaints_2010_2018
+```
+
+```{r}
+#union totals from 2018-2018 with 2019-2022
+
+rat_baiting_graph <- union(graph_data_2010_2018,graph_data_2019_2022)
+```
+
+
+```{r}
+#create graph of rat complaints
+ggplot(data=rat_baiting_graph, aes(x=year, y=total)) + geom_line() + theme_minimal()
+```
+
+## Rat map
+
+```{r}
+#create new object for map
+rats_map <- rats_streets_san_baited
+#break up address to prepare for geocoding
+rats_map[, 16:17] <- str_split_fixed(rats_map$`Service Request Address`, "<br>", 2)
+#isolate geocoding column
+rat_complaint_address <- rats_map %>%
+  dplyr::select(address=V1,everything())
+#join new data field for geocoding
+rat_complaint_address$address_concat <-  c(" , Chicago, IL")
+
+#create object to eventually join with geocoded data
+rat_map_data <- rat_complaint_address %>%
+  mutate(address_full=paste(address, address_concat, sep=""))
+
+#concatenate the fields for geocoding
+rat_complaint_address <- rat_complaint_address %>%
+  mutate(address_full=paste(address, address_concat, sep="")) %>% 
+  dplyr::select(address=address_full) %>%
+  distinct(address)
+  
+```
+
+```{r}
+#geocode the rat addresses, all hail the rat king
+
+# remove hashtag to execute — hashtag in place to ensure you don't accidentally start geocoding a batch of coordinates that Google will charge you hundreds of dollars for
+
+# rat_complaints_geocoded <- mutate_geocode(rat_complaint_address,address,output="latlona")
+```
+
+```{r}
+write_csv(rat_complaints_geocoded,'~/Desktop/rats/rat_addresses_geocoded.csv')
+```
+
+```{r}
+rat_complaints_geocoded <- read_csv('~/Desktop/rats/rat_addresses_geocoded.csv')
+```
+
+
+```{r}
+#join geocoded addresses with rat complaint data
+
+map_data <- rat_map_data %>%
+  inner_join(rat_complaints_geocoded,rat_map_data,by=c("address_full"="address...1")) %>% 
+  select(-c(address,`Service Request Address`,V2,address_concat,address_full))
+
+#rename geocoded address
+
+map_data <- rename(map_data, address=address...4)
+
+#remove nas for mapping 
+
+map_data <- subset(map_data, !is.na(lat))
+
+#map data for cesar
+
+write_csv(map_data,'~/Desktop/rats/map_data.csv')
+
+```
+
+```{r}
+#start building the rat map by importing city shapefiles
+
+chicago_map_shape <- st_read("~/Desktop/rats/shape_files/Boundaries - City/")
+chicago_pd_map <- st_read("~/Desktop/rats/shape_files/Boundaries - Police Districts (current)/")
+chicago_pd_beat_map <- st_read("~/Desktop/rats/shape_files/police_beat_files/")
+chicago_streets_map <- st_read("~/Desktop/rats/shape_files/Street Center Lines/")
+chicago_neighborhoods <- st_read("~/Desktop/rats/shape_files/Boundaries - Neighborhoods/")
+
+chicago_pd_beats <- chicago_pd_beat_map["beat_num"]
+chicago_pd_boundaries <- chicago_pd_map["dist_num"]
+chicago_boundaries <- chicago_map_shape["shape_area"]
+
+chi_neigh <- chicago_neighborhoods["pri_neigh"]
+```
+
+```{r}
+chi_highways <- chicago_streets_map %>% filter(class == 1 )
+
+chi_arterials <- chicago_streets_map %>% filter(class == 2)
+
+chi_highways <- chi_highways["class"]
+
+chi_arterials <- chi_arterials["class"]
+
+```
+
+
+```{r}
+
+#project the rat complaint lats and longs
+
+rat_complaints  <- st_as_sf(x = map_data, 
+                        coords = c("lon", "lat"),
+                        crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>% 
+  st_transform(crs=st_crs(chicago_pd_beats))
+
+sf::sf_use_s2(FALSE)
+
+#link the lats and longs to the police beats
+
+points_in <- st_join(chicago_pd_beats, rat_complaints, left=T)
+
+```
+
+```{r}
+#group by police beat
+
+complaints_by_beat <- points_in %>% 
+  group_by(beat_num) %>% 
+  summarize(total_complaints=n())
+```
+
+```{r}
+rat_complaints_by_beat_map <- ggplot(complaints_by_beat) +
+  geom_sf(aes(fill=total_complaints),color=NA) +
+  coord_sf(datum=NA) +
+  labs(title = "Rat complaints by police beat",
+       subtitle = "From 2019 to 2022",
+       caption = "Source: Chicago Streets and Sanitation",
+       fill = "Number of complaints") +
+  scale_fill_viridis(option="mako", direction=-1) +
+  geom_sf(data = chi_highways,
+          inherit.aes = FALSE,
+          color = "black",
+          size=.8) + 
+    geom_sf(data = chi_neigh,
+          inherit.aes = FALSE,
+          fill=NA,
+          size=.2) + 
+  theme_void()
+```
+
+```{r}
+rat_complaints_by_beat_map 
+```
+
+
+
+#Rat neighborhood maps
+
+```{r}
+rat_complaints_neigh  <- st_as_sf(x = map_data, 
+                        coords = c("lon", "lat"),
+                        crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>% 
+  st_transform(crs=st_crs(chi_neigh))
+
+sf::sf_use_s2(FALSE)
+
+#link the lats and longs to the police beats
+
+points_in_neigh <- st_join(chi_neigh, rat_complaints_neigh, left=T)
+```
+
+
+### Building code violations for rats
+
+```{r}
+rats_building_violations <- read_csv('~/Desktop/rats/rat_violations_buildings.csv')
+```
+
+```{r}
+#lowercase columns, rename columns, remove NAs from data set
+
+names(rats_building_violations) <- tolower(names(rats_building_violations))
+
+rats_building_violations <- rats_building_violations %>%
+  select(everything(),lat=latitude,lon=longitude)
+
+rats_building_violations <- subset(rats_building_violations, !is.na(lat))
+```
+
+
+
+```{r}
+rats_building_violations  <- st_as_sf(x = rats_building_violations, 
+                        coords = c("lon", "lat"),
+                        crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>% 
+  st_transform(crs=st_crs(chi_neigh))
+
+sf::sf_use_s2(FALSE)
+
+#link the lats and longs to the police beats
+
+points_in_neigh <- st_join(chi_neigh, rats_building_violations, left=T)
+
+
+
+```
+
+```{r}
+#drop geometry to prepare for a spreadsheet
+
+rat_building_code_violations <- st_drop_geometry(points_in_neigh)
+```
+
+
+```{r}
+#write to CSV
+
+write_csv(rat_building_code_violations, '~/Desktop/rats/building_code_violations_neighborhoods.csv')
+
+```
+
+
+## Censor phone numbers in 311 rat complaint data set
+
+```{r}
+complaints_phone <- read_csv('~/Desktop/rats/neighborhood_rat_complaints.csv')
+```
+
+```{r}
+#isolate cols
+redact_phone <- complaints_phone %>%
+  dplyr::select(Neighborhood=pri_neigh, description=`Service Request: Description`, Outcome=Answer, Detail=`Flex Answers Concatenated`, date, address, lon, lat)
+```
+
+```{r}
+#create regex
+phone <- regex("
+  \\(?       # optional opening parens
+  (\\d{3})   # area code
+  \\)?       # optional closing parens
+  (?:-|\\ )? # optional dash or space
+  (\\d{3})   # another three numbers
+  (?:-|\\ )? # optional dash or space
+  (\\d{4})   # four more numbers
+  ", comments = TRUE)
+```
+
+```{r}
+#insert the regex to remove the phone numbers from the data set
+
+redact_phone$description <- str_replace_all(redact_phone$description, phone, "XXXXXXXXXX")
+
+```
+
+```{r}
+write_csv(redact_phone, '~/Desktop/rats/redacted_phone_numbers.csv')
+```
+
+
+## Suzy B. Wilson ticketing data and geocoding
+
+```{sql connection=con, output.var="suzie_b_rats", echo=FALSE, cache = TRUE}
+SELECT * FROM rat_fines
+WHERE respondent_business_name ILIKE '%Suzie B%'
+OR respondent_business_name ILIKE '%Susie B%'
+OR respondent_business_name ILIKE '%Swedlana%'
+OR respondent_business_name ILIKE '%Micheal J%'
+```
+
+```{r}
+
+#find addresses from old dataset of fines for Suzie B. Wilson and check them again
+
+old_addresses <- suzie_b_rats %>% 
+  dplyr::select(violation_address,violation_city,violation_state) %>%
+  unique()
+  
+```
+
+
+```{r}
+#Save object showing Suzie B. Wilson fines from 2010 through 2018
+
+write_csv(suzie_b_rats,'~/Desktop/rats/suzie b wilson/fines_2010_2018.csv')
+```
+
+
+```{r}
+#Create object from 686 addresses from tickets issued to Wilson's companies from 2019 through 2022. Gleaned from Excel spreadsheet
+
+wilson_addresses <- read_csv('~/Desktop/rats/suzie b wilson/wilson_addresses.csv')
+```
+
+
+```{r}
+
+### geocode addresses for the tickets issued to Wilson's companies from 2019 through 2022 
+
+#### wilson_geocodes <- mutate_geocode(wilson_addresses,address,output="latlona")
+
+```
+
+```{r}
+#clean up column names
+wilson_geocodes <- wilson_geocodes %>% 
+  select(address=address...1, lon, lat, address_lat_lon=address...4)
+```
+
+
+```{r}
+#Save geocoded address to file
+write_csv(wilson_geocodes,'~/Desktop/rats/suzie b wilson/address_geocoded.csv')
+```
+
+
+```{r}
+#anti-join old addresses with new addresses
+
+unknown_addresses <- old_addresses %>% 
+  anti_join(wilson_geocodes, by=c("violation_address" = "address...1")) %>% 
+  mutate(violation_city = str_to_title(violation_city)) %>% 
+  mutate(address = str_c(violation_address, ', ', violation_city, ', ', violation_state)) %>% 
+  select(address)
+```
+
+
+
+```{r}
+
+## remove hashtags to geocode 148 addresses from 2010-2018 that were not previously geocoded in the 2019-2022 dataset
+
+## unknown_addresses_geocoded <- mutate_geocode(unknown_addresses,address,output="latlona")
+```
+
+
+```{r}
+write_csv(unknown_addresses_geocoded,'~/Desktop/rats/suzie b wilson/unknown_addresses_geocoded.csv')
+```
+
+```{r}
+unknown_addresses_geocoded  <- read_csv('~/Desktop/rats/suzie b wilson/unknown_addresses_geocoded.csv')
+```
+
+
+
+```{r}
+#rename columns
+unknown_addresses_geocoded <- unknown_addresses_geocoded %>% 
+  dplyr::select(address=address...1,lat,lon,address_lat_lon=address...4)
+
+```
+
+
+```{r}
+#join old geocoded data with new geocoded data
+all_wilson_geocodes <- union(unknown_addresses_geocoded,wilson_geocodes)
+```
+
+
+```{r}
+#clean up address by removing "Chicago, IL"
+all_wilson_geocodes$address  <- str_remove(all_wilson_geocodes$address,", Chicago, IL")
+```
+
+```{r}
+#join lat lona data with fine data
+wilson_fines_2010_2018_geo <- all_wilson_geocodes %>% 
+  inner_join(suzie_b_rats, by =c("address" = "violation_address"))
+
+```
+
+```{r}
+#remove NAs from geocoded data
+wilson_fines_2010_2018_geo <- wilson_fines_2010_2018_geo %>% 
+  filter(is.na(lat))
+```
+
+```{r}
+#save geocoded data to file.
+write_csv(wilson_fines_2010_2018_geo,'~/Desktop/rats/suzie b wilson/2010_2018_suzie_data_geo.csv')
+```
+
+
+```{r}
+#prep for map. show unique tickets showing total fines and fees for each address from 2010-2018
+
+suzie_b_wilson_map <- wilson_fines_2010_2018_geo %>% 
+  select(address,lat,lon,docket_nbr,current_amt_due,total_paid) %>% 
+  distinct() %>% 
+  group_by(address,lat,lon) %>%
+  summarize(total_tickets=n(),total_owed=sum(current_amt_due),total_paid=sum(total_paid)) %>%
+  select(address,total_tickets,total_owed,total_paid,lat,lon)
+
+```
+
+```{r}
+write_csv(suzie_b_wilson_map, '~/Desktop/rats/suzie_b_wilson_map.csv')
+```
+
+
+
+```{r}
+
+#using total geocoded data from 2010 to 2018, map each address by neighborhood according to City of Chicago's shapefiles
+
+wilson_map_coded  <- st_as_sf(x = suzie_b_wilson_map, 
+                        coords = c("lon", "lat"),
+                        crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>% 
+  st_transform(crs=st_crs(chi_neigh))
+
+sf::sf_use_s2(FALSE)
+
+#link the lats and longs to the neighborhoods
+
+wilson_points_in <- st_join(chi_neigh, wilson_map_coded, left=T)
+```
+
+```{r}
+#drop the geometry to prepare to summarize the data by neighborhood
+wilson_points_in <- st_drop_geometry(wilson_points_in)
+```
+
+
+```{r}
+
+#show the totals per neighborhood for suzie b. wilson tickets from 2010 to 2018
+
+wilson_neighborhood_totals <- wilson_points_in %>% 
+  group_by(pri_neigh) %>% 
+  summarize(tickets_neigh=sum(total_tickets),total_owed_neigh=sum(total_owed),total_paid_neigh=sum(total_paid)) %>% 
+  drop_na(tickets_neigh)
+
+view(wilson_neighborhood_totals)
+```
+
+
+```{r}
+#Upload Suzie B. Wilson's fines from 2019_2013
+
+wilson_fines_2019_2023 <- read_csv('~/Desktop/rats/wilson_fines_2019_2023.csv')
+```
+
+```{r}
+#join these fines with geocodes 
+wilson_fines_2019_2023_geo <- wilson_fines_2019_2023 %>%
+  inner_join(all_wilson_geocodes,by="address")
+```
+
+```{r}
+#distinct the fines and group them together
+wilson_fines_2019_2023_total <- wilson_fines_2019_2023_geo %>% 
+  select(address,lat,lon,docket_nbr,current_amt_due,total_paid) %>% 
+  distinct() %>% 
+  group_by(address,lat,lon) %>%
+  summarize(total_tickets=n(),total_owed=sum(current_amt_due),total_paid=sum(total_paid)) %>%
+  select(address,total_tickets,total_owed,total_paid,lat,lon)
+  
+```
+
+
+```{r}
+#COMBINING DATA SETS
+wilson_2019_2023_totals <- wilson_fines_2019_2023_geo %>% 
+  select(address,lat,lon,docket_nbr,current_amt_due,total_paid)
+
+wilson_2010_2019_totals <- wilson_fines_2010_2018_geo %>% 
+  select(address,lat,lon,docket_nbr,current_amt_due,total_paid)
+
+```
+
+```{r}
+#join the two data sets with union
+wilson_2010_2023 <- union(wilson_2010_2019_totals,wilson_2019_2023_totals)
+```
+
+```{r}
+#summarize all data
+wilson_totals_2010_2023 <- wilson_2010_2023 %>% 
+  select(address,lat,lon,docket_nbr,current_amt_due,total_paid) %>% 
+  distinct() %>%
+  group_by(address,lat,lon) %>%
+  summarize(total_tickets=n(),total_owed=sum(current_amt_due),total_paid=sum(total_paid))
+```
+
+```{r}
+write_csv(wilson_totals_2010_2023,'~/Desktop/rats/wilson_totals_2010_2023.csv')
+```
+
+
+```{r}
+#prepare to assign neighborhood to each address by reprojecting crs
+all_wilson_tix <- st_as_sf(x = wilson_totals_2010_2023, 
+                        coords = c("lon", "lat"),
+                        crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>% 
+  st_transform(crs=st_crs(chi_neigh))
+
+sf::sf_use_s2(FALSE)
+
+#link the lats and longs to the neighborhoods
+
+wilson_tix_neigh <- st_join(chi_neigh, all_wilson_tix, left=T)
+```
+
+```{r}
+#add up totals for neighborhood geometry
+wilson_geometry_totals_by_neigh <- wilson_tix_neigh %>%
+  drop_na() %>% 
+  dplyr::select(Neighborhood=pri_neigh, address,total_tickets,total_owed,total_paid) %>% 
+  group_by(Neighborhood) %>% 
+  summarize(`Total addresses ticketed`=n(),`Total tickets`=sum(total_tickets),`Outstanding fines`=sum(total_owed),`Total paid`=sum(total_paid)) %>% 
+  filter(Neighborhood != 'Loop')
+```
+
+```{r}
+wilson_tix_neigh <- st_drop_geometry(wilson_tix_neigh)
+```
+
+
+```{r}
+##save as shapefile
+st_write(wilson_geometry_totals_by_neigh, '~/Desktop/rats/wilson_shapefile.shp')
+```
+
+
+## Determine lenghts of time between 311 complaints and response by neighborhood and year
+
+```{sql connection=con, output.var="med_311_response_length_by_year", echo=FALSE, cache = TRUE}
+SELECT year, PERCENTILE_CONT(0.5) WITHIN GROUP(ORDER BY difference) AS median
+FROM (SELECT sr_number, DATE_PART('year',created_date) AS year, created_date, closed_date, closed_date - created_date AS difference
+FROM rat_complaints_311
+ORDER BY DATE_PART('year',created_date), closed_date - created_date) AS diff
+GROUP BY year
+
+```
+
+
+```{r}
+#shows the median response length by year
+med_311_response_length_by_year
+```
+
+```{sql connection=con, output.var="response_length_geo", echo=FALSE, cache = TRUE}
+SELECT sr_number, street_address, lat, lon, DATE_PART('year',created_date) AS year, created_date, closed_date, closed_date - created_date AS difference
+FROM rat_complaints_311
+JOIN rat_geocoded ON rat_complaints_311.street_address = rat_geocoded.address
+WHERE lat != 'NA'
+ORDER BY DATE_PART('year',created_date), closed_date - created_date;
+
+```
+
+
+```{r}
+#assigns neighborhood to each rat complaint
+response_length_coded  <- st_as_sf(x = response_length_geo, 
+                        coords = c("lon", "lat"),
+                        crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>% 
+  st_transform(crs=st_crs(chi_neigh))
+
+sf::sf_use_s2(FALSE)
+
+#link the lats and longs to the neighborhoods
+
+points_in_response <- st_join(chi_neigh, response_length_coded, left=T)
+```
+
+```{r}
+#drop geometry
+neighborhood_response <- st_drop_geometry(points_in_response)
+```
+
+```{r}
+#find the difference in the created date and closed date for each complaint 
+date_diff <- neighborhood_response %>% 
+  mutate(diff_date = (closed_date - created_date))
+
+date_diff <- date_diff %>%
+  drop_na()
+
+```
+
+```{r}
+#find the median response time for rat comlpaint for each neighborhood and year
+by_hood <- date_diff %>%
+  group_by(year,pri_neigh) %>%
+  summarize(median_diff=median(diff_date))
+```
+
+
+```{r}
+#flip the the seconds into days to see the difference by neighborhood
+neighborhood_response_rate <- by_hood %>%
+  mutate(diff_converted = seconds_to_period(median_diff))
+
+```
+
+```{r}
+#save to file
+write_csv(neighborhood_response_rate,'~/Desktop/rats/neighborhood_response_rate.csv')
+```
+
+
+### APPENDIX
+
+Chicago's Streets and Sanitation Department supplied the rat complaint data. Chicago's 311 data portal supplied rat complaint data going as far back to 2010, although we only used individual complaint numbers from those years.
+
+Chicago's Finance Department supplied the complete ticketing data after we supplied a list of municipal code violations that the Streets and Sanitation Department supplied to us when we requested for a list of their rat-related tickets. Because one rat-related ticket might contain seven violations, two of which might not be rat-related (someone might get cited for unshoveled snow on the sidewalk in the same ticket they are getting dinged for an overflowing dumpster, for example), we eliminated these non-rat-related municipal codes from the overall list.
